@@ -1,0 +1,20 @@
+{
+  "type": "object",
+  "properties": {
+    "accounts": {
+      "type": "array",
+      "title": "Accounts",
+      "items": {
+        "type": "object",
+        "properties": {
+          "username": {"type": "string"},
+          "password": {"type": "string"}
+        },
+        "required": ["username", "password"]
+      },
+      "default": [],
+      "description": "Qwen 登录账号列表，每项含 username 和 password"
+    }
+  },
+  "required": ["accounts"]
+}
