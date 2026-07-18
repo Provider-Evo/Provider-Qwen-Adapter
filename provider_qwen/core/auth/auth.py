@@ -1,39 +1,28 @@
 from __future__ import annotations
 
-"""Authentication and account background-management helpers."""
+"""Authentication helpers: login, account configuration, token expiry checks."""
 
 import asyncio
 import base64
 import json
-import random
 import time
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
 import aiohttp
 
 if TYPE_CHECKING:
     from ..adapter.client import Account
-from ..config.endpoints import (
-    AUTH_BASE_URL,
+from ..config.endpts import (
     BASE_URL,
-    COOKIE_REFRESH_INTERVAL,
-    LOGIN_BATCH_SIZE,
-    LOGIN_POLL_INTERVAL,
-    LOGIN_POOL_SIZE,
-    LOGIN_SELECT_MAX,
-    LOGIN_SELECT_MIN,
     SETTINGS_PATH,
     SIGNIN_PATH,
-    TOKEN_CHECK_INTERVAL,
     TOKEN_EXPIRY_MARGIN,
     TOKEN_LIFETIME,
-    TOKEN_REFRESH_INTERVAL,
 )
 from ..http.headers import build_headers, build_login_headers
-from .password import hash_password
-from ..config.settings import DEFAULT_FULL_SETTINGS
-from ..config.constants import SMART_PROXY_ENABLED
-from .crypto import generate_cookies, generate_fingerprint
+from .passwd import hash_password
+from ..config.config import DEFAULT_FULL_SETTINGS
+from ..config.consts import SMART_PROXY_ENABLED
 try:
     from src.foundation.logger import get_logger
 except ImportError:
@@ -64,12 +53,10 @@ def _jwt_expires_at(token: str) -> float:
 
 
 class AuthMixin:
-    """Mixin implementing Qwen account authentication workflows."""
+    """Mixin implementing Qwen account login and profile/settings sync."""
 
     def _is_proxy_available(self) -> bool:
         """Check if proxy should be tried (respects cooldown after failure)."""
-        if not hasattr(self, "_proxy_cooldown_until"):
-            self._proxy_cooldown_until = 0.0
         return time.time() >= self._proxy_cooldown_until
 
     def _mark_proxy_failed(self) -> None:
@@ -98,41 +85,10 @@ class AuthMixin:
         proxy_kwarg = self._get_proxy_kwarg()
         use_proxy = proxy_kwarg is not None
 
-        async def _attempt(proxy: Optional[str]) -> None:
-            async with self._session.post(
-                f"{AUTH_BASE_URL}{SIGNIN_PATH}",
-                json=payload,
-                headers=build_login_headers(),
-                ssl=False,
-                timeout=aiohttp.ClientTimeout(total=30),
-                proxy=proxy,
-            ) as response:
-                if response.status != 200:
-                    raise RuntimeError(
-                        f"Qwen 登录失败 HTTP {response.status}: {(await response.text())[:300]}"
-                    )
-                data = await response.json()
-                envelope = data.get("data") if isinstance(data.get("data"), dict) else {}
-                user = envelope.get("user") if isinstance(envelope.get("user"), dict) else {}
-                token = (
-                    user.get("token")
-                    or envelope.get("access_token")
-                    or data.get("access_token")
-                    or ""
-                )
-                if not token:
-                    raise RuntimeError(f"Qwen 登录响应缺少 token: {data}")
-                account.token = token
-                account.is_login = True
-                account.last_login = time.time()
-                account.token_expires = _jwt_expires_at(token) or (time.time() + TOKEN_LIFETIME)
-                if hasattr(self, "_cookies"):
-                    self._cookies["token"] = token
-
         # Try with proxy first if available and not in cooldown
         if use_proxy and self._is_proxy_available():
             try:
-                await _attempt(proxy_kwarg)
+                await self._login_attempt(account, payload, proxy_kwarg)
                 if SMART_PROXY_ENABLED:
                     self._proxy_selector.record(True, True)
                 return True
@@ -146,7 +102,7 @@ class AuthMixin:
 
         # Direct attempt (fallback or primary when no proxy configured)
         try:
-            await _attempt(None)
+            await self._login_attempt(account, payload, None)
             if SMART_PROXY_ENABLED:
                 self._proxy_selector.record(False, True)
             return True
@@ -154,6 +110,41 @@ class AuthMixin:
             if SMART_PROXY_ENABLED:
                 self._proxy_selector.record(False, False)
             raise
+
+    async def _login_attempt(self, account: Account, payload: Dict[str, Any], proxy: Optional[str]) -> None:
+        async with self._session.post(
+            "{}{}".format(BASE_URL, SIGNIN_PATH),
+            json=payload,
+            headers=build_login_headers(),
+            ssl=False,
+            timeout=aiohttp.ClientTimeout(total=30),
+            proxy=proxy,
+        ) as response:
+            if response.status != 200:
+                raise RuntimeError(
+                    "Qwen 登录失败 HTTP {}: {}".format(response.status, (await response.text())[:300])
+                )
+            body = await response.text()
+            ct = response.headers.get("Content-Type", "")
+            if "text/html" in ct or (body.lstrip()[:15].lower().startswith(("<!doctype", "<html"))):
+                raise RuntimeError("Qwen 登录被拦截(HTML 响应)")
+            data = json.loads(body)
+            envelope = data.get("data") if isinstance(data.get("data"), dict) else {}
+            user = envelope.get("user") if isinstance(envelope.get("user"), dict) else {}
+            token = (
+                user.get("token")
+                or envelope.get("token")
+                or envelope.get("access_token")
+                or data.get("access_token")
+                or ""
+            )
+            if not token:
+                raise RuntimeError("Qwen 登录响应缺少 token: {}".format(data))
+            account.token = token
+            account.is_login = True
+            account.last_login = time.time()
+            account.token_expires = _jwt_expires_at(token) or (time.time() + TOKEN_LIFETIME)
+            self._cookies["token"] = token
 
     async def _fetch_with_proxy_fallback(self, url: str, account: Account) -> Dict[str, Any]:
         """GET request with proxy fallback — try proxy first, fall back to direct on proxy error."""
@@ -182,20 +173,15 @@ class AuthMixin:
             return await response.json(content_type=None)
 
     async def _fetch_user_settings(self, account: Account) -> Dict[str, Any]:
-        return await self._fetch_with_proxy_fallback(f"{BASE_URL}{SETTINGS_PATH}", account)
+        return await self._fetch_with_proxy_fallback("{}{}".format(BASE_URL, SETTINGS_PATH), account)
 
     async def _fetch_user_profile(self, account: Account) -> Dict[str, Any]:
-        return await self._fetch_with_proxy_fallback(f"{AUTH_BASE_URL}/api/v2/user", account)
+        return await self._fetch_with_proxy_fallback("{}/api/v2/user".format(BASE_URL), account)
 
     async def _configure_account(self, account: Account) -> None:
         profile = await self._fetch_user_profile(account)
         profile_data = profile.get("data", profile) if isinstance(profile, dict) else {}
         account.user_id = str(profile_data.get("id") or profile_data.get("user_id") or account.user_id or "")
-
-# === PART-TAIL v2 ===
-# 此 part_01.py 由原文件拆出，含本模块的主入口符号。
-# 其余 part_NN.py 持有辅助函数、扩展点、私有实现。
-# 详情见 PROJECT_DECISIONS.md#module-split。
 
         settings = await self._fetch_user_settings(account)
         settings_data = settings.get("data", settings) if isinstance(settings, dict) else {}
@@ -213,7 +199,7 @@ class AuthMixin:
 
         async def _put(proxy: Optional[str]) -> None:
             async with self._session.put(
-                f"{BASE_URL}{SETTINGS_PATH}",
+                "{}{}".format(BASE_URL, SETTINGS_PATH),
                 json=DEFAULT_FULL_SETTINGS,
                 headers=headers,
                 ssl=False,
@@ -267,137 +253,3 @@ class AuthMixin:
         if not expires_at:
             return True
         return expires_at <= time.time() + TOKEN_EXPIRY_MARGIN
-
-    def _sync_expired_account_states(self) -> bool:
-        """Mark accounts past TOKEN_LIFETIME / token_expires as logged out."""
-        changed = False
-        for account in self._account_states.values():
-            if not account.is_login and not account.token:
-                continue
-            if not account.token or self._is_token_expired(account):
-                if account.is_login or account.token:
-                    account.is_login = False
-                    account.token = ""
-                    changed = True
-        if changed:
-            self._rebuild_candidates()
-        return changed
-
-    async def _relogin_accounts(self, accounts: List[Account]) -> None:
-        """Refresh one or more accounts and rebuild routing candidates."""
-        if not accounts:
-            return
-        semaphore = asyncio.Semaphore(LOGIN_POOL_SIZE)
-
-        async def worker(account: Account) -> None:
-            async with semaphore:
-                try:
-                    if account.token and self._is_token_expired(account):
-                        self._log_queued_relogin(account.username[:6])
-                        account.token = ""
-                    account.is_login = False
-                    await self._login_and_configure(account)
-                except Exception as exc:
-                    account.is_login = False
-                    self._log_login_failure(account.username[:6], str(exc))
-
-        await asyncio.gather(*(worker(acc) for acc in accounts), return_exceptions=True)
-        self._rebuild_candidates()
-        self._save_persist()
-
-    def _accounts_due_for_refresh(self) -> List[Account]:
-        """Logged-in accounts whose token expires within TOKEN_REFRESH_INTERVAL."""
-        horizon = time.time() + TOKEN_REFRESH_INTERVAL
-        due: List[Account] = []
-        for account in self._account_states.values():
-            if not account.token or not account.is_login:
-                continue
-            if self._is_token_expired(account):
-                continue
-            expires_at = self._token_expires_at(account)
-            if expires_at and expires_at <= horizon:
-                due.append(account)
-        return due
-
-    def _select_login_batch(self) -> List[Account]:
-        pool = [acc for acc in self._account_states.values() if self._is_token_expired(acc) or not acc.is_login]
-        if not pool:
-            return []
-        random.shuffle(pool)
-        upper = min(LOGIN_SELECT_MAX, max(LOGIN_SELECT_MIN, LOGIN_BATCH_SIZE), len(pool))
-        lower = min(LOGIN_SELECT_MIN, upper)
-        size = upper if upper == lower else random.randint(lower, upper)
-        return pool[:size]
-
-    async def _initial_login_pass(self) -> None:
-        self._sync_expired_account_states()
-        batch = self._select_login_batch()
-        if not batch:
-            return
-        await self._relogin_accounts(batch)
-
-    async def _login_poll_loop(self) -> None:
-        timers = self._load_task_timers()
-        last_run = timers.get("login_poll", 0)
-        remaining = LOGIN_POLL_INTERVAL - (time.time() - last_run)
-        while not self._closing:
-            sleep_time = remaining if remaining > 0 else LOGIN_POLL_INTERVAL
-            remaining = -1
-            await asyncio.sleep(sleep_time)
-            if self._closing:
-                break
-            try:
-                self._sync_expired_account_states()
-                batch = self._select_login_batch()
-                proactive = self._accounts_due_for_refresh()
-                targets: List[Account] = []
-                seen = set()
-                for account in batch + proactive:
-                    if account.username in seen:
-                        continue
-                    seen.add(account.username)
-                    targets.append(account)
-                if targets:
-                    await self._relogin_accounts(targets)
-                elif self._sync_expired_account_states():
-                    self._save_persist()
-            except Exception as exc:
-                logger.warning("Qwen 登录轮询异常: %s", exc)
-            timers["login_poll"] = time.time()
-            self._save_task_timers(timers)
-
-    async def _bg_token_expiry_watch(self) -> None:
-        """Periodically invalidate expired accounts and relogin immediately."""
-        while not self._closing:
-            await asyncio.sleep(TOKEN_CHECK_INTERVAL)
-            if self._closing:
-                break
-            try:
-                expired = [
-                    account
-                    for account in self._account_states.values()
-                    if account.token and self._is_token_expired(account)
-                ]
-                if expired:
-                    for account in expired:
-                        account.is_login = False
-                        account.token = ""
-                    self._rebuild_candidates()
-                    self._save_persist()
-                    await self._relogin_accounts(expired)
-                elif self._sync_expired_account_states():
-                    self._save_persist()
-            except Exception as exc:
-                logger.warning("Qwen token 过期巡检异常: %s", exc)
-
-    async def _bg_cookie_refresh(self) -> None:
-        while not self._closing:
-            await asyncio.sleep(COOKIE_REFRESH_INTERVAL)
-            if self._closing:
-                break
-            try:
-                self._fp = generate_fingerprint()
-                self._cookies = generate_cookies(self._fp)
-                self._save_persist()
-            except Exception as exc:
-                logger.warning("Qwen Cookie 刷新失败: %s", exc)

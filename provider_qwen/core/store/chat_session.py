@@ -7,10 +7,10 @@ from typing import Any, AsyncGenerator, Callable, Dict, Optional, Tuple, Union
 
 import aiohttp
 
-from ..config.endpoints import BASE_URL, CHAT_PATH, DELETE_CHAT_PATH, GENERATED_IMAGE_DIR, NEW_CHAT_PATH, SSE_TIMEOUT, STOP_CHAT_PATH
+from ..config.endpts import BASE_URL, CHAT_PATH, DELETE_CHAT_PATH, GENERATED_IMAGE_DIR, NEW_CHAT_PATH, SSE_TIMEOUT, STOP_CHAT_PATH
 from ..config.errors import TokenExpiredError, WafBlockedError
 from ..http.headers import build_headers, build_stop_headers
-from ..http.payloads import build_new_chat_payload, build_payload, build_stop_payload
+from ..http.payload import build_new_chat_payload, build_payload, build_stop_payload
 from ..http.stream import StreamHandler
 from .storage import save_image_file
 from ..http.sse import parse_sse_event

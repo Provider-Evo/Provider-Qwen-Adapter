@@ -50,15 +50,15 @@ if __package__ in {None, ""}:
     root = Path(__file__).resolve().parents[1]
     if str(root) not in sys.path:
         sys.path.insert(0, str(root))
-    from core.config.endpoints import AUTH_BASE_URL, BASE_URL, CHAT_PATH, NEW_CHAT_PATH
+    from core.config.endpts import AUTH_BASE_URL, BASE_URL, CHAT_PATH, NEW_CHAT_PATH
     from core.http.headers import build_headers, build_login_headers
-    from core.auth.password import hash_password
+    from core.auth.passwd import hash_password
     from core.http.sse import parse_sse_event
     from mvp.env import get_credentials
 else:
-    from ..core.config.endpoints import AUTH_BASE_URL, BASE_URL, CHAT_PATH, NEW_CHAT_PATH
+    from ..core.config.endpts import AUTH_BASE_URL, BASE_URL, CHAT_PATH, NEW_CHAT_PATH
     from ..core.http.headers import build_headers, build_login_headers
-    from ..core.auth.password import hash_password
+    from ..core.auth.passwd import hash_password
     from ..core.http.sse import parse_sse_event
     from .env import get_credentials
 
@@ -66,7 +66,7 @@ else:
 async def _login(session: aiohttp.ClientSession, email: str, password: str) -> str:
     """Log in with the current v2 endpoint and return the access token."""
     async with session.post(
-        f"{AUTH_BASE_URL}/api/v2/auths/signin",
+        f"{BASE_URL}/api/v2/auths/signin",
         json={"email": email, "password": hash_password(password), "remember_me": True},
         headers=build_login_headers(),
         ssl=False,
@@ -77,7 +77,8 @@ async def _login(session: aiohttp.ClientSession, email: str, password: str) -> s
         data = await response.json()
         if not data.get("success"):
             raise RuntimeError(f"login failed: {data}")
-        token = str((data.get("data") or {}).get("access_token", ""))
+        envelope = data.get("data") or {}
+        token = str(envelope.get("token") or envelope.get("access_token") or "")
         if not token:
             raise RuntimeError(f"missing access token: {data}")
         return token
@@ -108,6 +109,93 @@ async def _create_chat(session: aiohttp.ClientSession, token: str, model: str) -
         return chat_id
 
 
+def _build_chat_payload(message: str, chat_id: str, model: str) -> Dict[str, Any]:
+    """Build the streaming chat request payload for a single user message."""
+    return {
+        "stream": True,
+        "version": "2.1",
+        "incremental_output": True,
+        "chat_id": chat_id,
+        "chat_mode": "local",
+        "model": model,
+        "parent_id": None,
+        "messages": [
+            {
+                "fid": str(uuid.uuid4()),
+                "parentId": None,
+                "childrenIds": [str(uuid.uuid4())],
+                "role": "user",
+                "content": message,
+                "user_action": "chat",
+                "files": [],
+                "timestamp": int(time.time() * 1000),
+                "models": [model],
+                "chat_type": "t2t",
+                "feature_config": {
+                    "thinking_enabled": True,
+                    "output_schema": "phase",
+                    "research_mode": "normal",
+                    "auto_thinking": False,
+                    "thinking_mode": "Thinking",
+                    "thinking_format": "raw",
+                    "auto_search": False,
+                },
+                "extra": {"meta": {"subChatType": "t2t"}},
+                "sub_chat_type": "t2t",
+            }
+        ],
+        "timestamp": int(time.time() * 1000),
+    }
+
+
+def _parse_sse_line(raw: bytes) -> Any:
+    """Decode one SSE line and return the parsed JSON payload, or None if not a data line."""
+    line = raw.decode("utf-8", errors="replace").strip()
+    if not line.startswith("data:"):
+        return None
+    data_str = line[5:].strip()
+    if not data_str or data_str == "[DONE]":
+        return None
+    try:
+        return json.loads(data_str)
+    except Exception:
+        return None
+
+
+async def _stream_chat_events(
+    session: aiohttp.ClientSession,
+    token: str,
+    chat_id: str,
+    payload: Dict[str, Any],
+) -> AsyncGenerator[Dict[str, Any], None]:
+    """Post the chat request and yield thinking/answer events parsed from the SSE stream."""
+    async with session.post(
+        "{0}{1}?chat_id={2}".format(BASE_URL, CHAT_PATH, chat_id),
+        json=payload,
+        headers=build_headers(token, chat_id=chat_id, include_sse=True),
+        ssl=False,
+        timeout=aiohttp.ClientTimeout(total=300),
+    ) as response:
+        if response.status != 200:
+            raise RuntimeError(
+                "chat HTTP {0}: {1}".format(response.status, (await response.text())[:300])
+            )
+        async for raw in response.content:
+            event_payload = _parse_sse_line(raw)
+            if event_payload is None:
+                continue
+            choices = event_payload.get("choices") or []
+            if not choices:
+                continue
+            delta = choices[0].get("delta", {})
+            phase = delta.get("phase", "")
+            content = delta.get("content", "")
+            if phase == "think" and content:
+                yield {"type": "thinking", "content": content}
+            elif phase == "answer" and content:
+                yield {"type": "answer", "content": content}
+
+
 async def get_qwen_stream(message: str, model: str = "qwen3.7-max") -> AsyncGenerator[Dict[str, Any], None]:
     """Log in directly and stream one response without host-project dependencies."""
     email, password = get_credentials()
@@ -116,71 +204,9 @@ async def get_qwen_stream(message: str, model: str = "qwen3.7-max") -> AsyncGene
             token = await _login(session, email, password)
             chat_id = await _create_chat(session, token, model)
             yield {"type": "chat_id", "content": chat_id}
-            payload = {
-                "stream": True,
-                "version": "2.1",
-                "incremental_output": True,
-                "chat_id": chat_id,
-                "chat_mode": "local",
-                "model": model,
-                "parent_id": None,
-                "messages": [
-                    {
-                        "fid": str(uuid.uuid4()),
-                        "parentId": None,
-                        "childrenIds": [str(uuid.uuid4())],
-                        "role": "user",
-                        "content": message,
-                        "user_action": "chat",
-                        "files": [],
-                        "timestamp": int(time.time() * 1000),
-                        "models": [model],
-                        "chat_type": "t2t",
-                        "feature_config": {
-                            "thinking_enabled": True,
-                            "output_schema": "phase",
-                            "research_mode": "normal",
-                            "auto_thinking": False,
-                            "thinking_mode": "Thinking",
-                            "thinking_format": "raw",
-                            "auto_search": False,
-                        },
-                        "extra": {"meta": {"subChatType": "t2t"}},
-                        "sub_chat_type": "t2t",
-                    }
-                ],
-                "timestamp": int(time.time() * 1000),
-            }
-            async with session.post(
-                f"{BASE_URL}{CHAT_PATH}?chat_id={chat_id}",
-                json=payload,
-                headers=build_headers(token, chat_id=chat_id, include_sse=True),
-                ssl=False,
-                timeout=aiohttp.ClientTimeout(total=300),
-            ) as response:
-                if response.status != 200:
-                    raise RuntimeError(f"chat HTTP {response.status}: {(await response.text())[:300]}")
-                async for raw in response.content:
-                    line = raw.decode("utf-8", errors="replace").strip()
-                    if not line.startswith("data:"):
-                        continue
-                    data_str = line[5:].strip()
-                    if not data_str or data_str == "[DONE]":
-                        continue
-                    try:
-                        payload = json.loads(data_str)
-                    except Exception:
-                        continue
-                    choices = payload.get("choices") or []
-                    if not choices:
-                        continue
-                    delta = choices[0].get("delta", {})
-                    phase = delta.get("phase", "")
-                    content = delta.get("content", "")
-                    if phase == "think" and content:
-                        yield {"type": "thinking", "content": content}
-                    elif phase == "answer" and content:
-                        yield {"type": "answer", "content": content}
+            payload = _build_chat_payload(message, chat_id, model)
+            async for event in _stream_chat_events(session, token, chat_id, payload):
+                yield event
             yield {"type": "done"}
         except Exception as exc:
             yield {"type": "error", "content": str(exc)}

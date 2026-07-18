@@ -4,14 +4,15 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 import time
 from pathlib import Path
-from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple
 
 import aiohttp
 
 try:
-    from src.core.dispatch.candidate import Candidate, make_id
+    from src.core.dispatch.cand import Candidate, make_id
 except ModuleNotFoundError:
     from .runtime import Candidate, make_id
 
@@ -27,31 +28,27 @@ except ModuleNotFoundError:
 
 from dataclasses import dataclass
 from ..auth.auth import AuthMixin
+from ..auth.auth_sched import AuthScheduleMixin
 from ..store.chat_session import ChatSession
-from ..config.constants import CAPS, MODELS, COOKIE_REFRESH_INTERVAL, SMART_PROXY_ENABLED
+from ..config.consts import CAPS, MODELS
 from ..auth.crypto import generate_cookies, generate_fingerprint
-from ..config.endpoints import (
+from ..config.endpts import (
     BASE_URL,
-    CHAT_PATH,
     MODELS_PATH,
     PROXY_SELECTOR_PERSIST_PATH,
     PERSIST_INTERVAL,
-    SSE_TIMEOUT,
     TASK_TIMERS_PATH,
-    TTS_DIR,
 )
-from ..config.errors import WafBlockedError, TokenExpiredError
 from ..http.headers import build_headers
 from ..store.logs import LogsMixin
 from ..media.media import MediaMixin
 from ..config.models import extract_model_ids
-from ..http.payloads import build_payload
-from ..store.persistence import load_persist, save_persist
+from ..store.persist import load_persist, save_persist
 from ..config.proxy import ProxyState
 from ..media.upload import UploadMixin
-from ..http.stream import StreamHandler
 from ..http.tts import TtsService
 from ..media.video import VideoService
+from .client_cmpl import ClientCompleteMixin
 
 
 @dataclass
@@ -71,14 +68,28 @@ class Account:
 
 
 def _load_accounts() -> List[Account]:
-    """从插件自身 config.toml 读取账号配置并返回账号列表。"""
+    """从本地 accounts.py（不入版本控制）读取账号列表，缺失时回退 config.toml。"""
     from pathlib import Path
-    from src.foundation.config.reader import get_config_reader
 
     plugin_dir = Path(__file__).resolve().parents[3]
-    reader = get_config_reader()
-    config, _schema, _raw = reader.get_plugin_config(plugin_dir)
-    raw = config.get("accounts", [])
+
+    raw: List[Dict[str, str]] = []
+    accounts_path = plugin_dir / "accounts.py"
+    if accounts_path.is_file():
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("_qwen_accounts", accounts_path)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        raw = module.ACCOUNTS
+    else:
+        from src.foundation.config.reader import get_config_reader
+
+        reader = get_config_reader()
+        config, _schema, _raw = reader.get_plugin_config(plugin_dir)
+        raw = config.get("accounts", [])
+
     if not isinstance(raw, list):
         return []
     accounts: List[Account] = []
@@ -88,7 +99,7 @@ def _load_accounts() -> List[Account]:
     return accounts
 
 
-class QwenClient(AuthMixin, UploadMixin, MediaMixin, LogsMixin):
+class QwenClient(AuthMixin, AuthScheduleMixin, ClientCompleteMixin, UploadMixin, MediaMixin, LogsMixin):
     """Current Qwen web client used by the adapter."""
 
     def __init__(self) -> None:
@@ -114,6 +125,8 @@ class QwenClient(AuthMixin, UploadMixin, MediaMixin, LogsMixin):
         self._chat_session: Optional[ChatSession] = None
         self._tts_service: Optional[TtsService] = None
         self._video_service: Optional[VideoService] = None
+        self._rate_limit_until: Dict[str, float] = {}
+        self._proxy_cooldown_until: float = 0.0
 
     def get_models(self) -> List[str]:
         return list(self._models)
@@ -141,6 +154,8 @@ class QwenClient(AuthMixin, UploadMixin, MediaMixin, LogsMixin):
             return get_proxy_server() if config.platforms_proxy.is_platform_enabled("qwen") else None
         if self._proxy_state.override is False:
             return None
+        from ..config.consts import SMART_PROXY_ENABLED
+
         if SMART_PROXY_ENABLED and self._proxy_selector.select():
             return get_proxy_server()
         return None
@@ -201,18 +216,7 @@ class QwenClient(AuthMixin, UploadMixin, MediaMixin, LogsMixin):
 
     async def close(self) -> None:
         self._closing = True
-        for attr_name, flush_name in [
-            ("_relogin_flush_task", "_flush_relogin_buffer_now"),
-            ("_retry_log_flush_task", "_flush_retry_log_buffer_now"),
-            ("_login_fail_flush_task", "_flush_login_fail_buffer_now"),
-        ]:
-            task = getattr(self, attr_name, None)
-            if task is not None and not task.done():
-                task.cancel()
-                setattr(self, attr_name, None)
-            flush = getattr(self, flush_name, None)
-            if callable(flush):
-                flush()
+        self._cancel_log_flush_tasks()
         for task in self._bg_tasks:
             task.cancel()
         for task in self._bg_tasks:
@@ -222,6 +226,20 @@ class QwenClient(AuthMixin, UploadMixin, MediaMixin, LogsMixin):
                 continue
         self._bg_tasks.clear()
         self._save_persist()
+
+    def _cancel_log_flush_tasks(self) -> None:
+        if self._relogin_flush_task is not None and not self._relogin_flush_task.done():
+            self._relogin_flush_task.cancel()
+            self._relogin_flush_task = None
+        self._flush_relogin_buffer_now()
+        if self._retry_log_flush_task is not None and not self._retry_log_flush_task.done():
+            self._retry_log_flush_task.cancel()
+            self._retry_log_flush_task = None
+        self._flush_retry_log_buffer_now()
+        if self._login_fail_flush_task is not None and not self._login_fail_flush_task.done():
+            self._login_fail_flush_task.cancel()
+            self._login_fail_flush_task = None
+        self._flush_login_fail_buffer_now()
 
     def _rebuild_candidates(self) -> None:
         self._candidates = [
@@ -243,12 +261,16 @@ class QwenClient(AuthMixin, UploadMixin, MediaMixin, LogsMixin):
             if account.is_login
             and account.token
             and not self._is_token_expired(account)
+            and time.time() >= self._rate_limit_until.get(account.username, 0)
         ]
 
     async def candidates(self) -> List[Candidate]:
         self._sync_expired_account_states()
         self._rebuild_candidates()
         return list(self._candidates)
+
+    def _set_rate_limit_cooldown(self, email: str, seconds: float = 60.0) -> None:
+        self._rate_limit_until[email] = time.time() + seconds
 
     async def ensure_candidates(self, count: int) -> int:
         return len(self._candidates)
@@ -290,7 +312,7 @@ class QwenClient(AuthMixin, UploadMixin, MediaMixin, LogsMixin):
         token = self._get_any_valid_token()
         if not token:
             return []
-        endpoints = [f"{BASE_URL}{MODELS_PATH}", f"{BASE_URL}/api/v1/models"]
+        endpoints = ["{}{}".format(BASE_URL, MODELS_PATH), "{}/api/v1/models".format(BASE_URL)]
         headers = build_headers(token, cookies=self._cookies)
         for endpoint in endpoints:
             try:
@@ -324,182 +346,3 @@ class QwenClient(AuthMixin, UploadMixin, MediaMixin, LogsMixin):
 
     async def _send_placeholder_message(self, chat_id: str, token: str, model: str):
         return await self._chat_session.send_placeholder_message(chat_id, token, model)
-
-    async def complete(
-        self,
-        candidate: Candidate,
-        messages: List[Dict[str, Any]],
-        model: str,
-        stream: bool,
-        *,
-        thinking: bool = False,
-        search: bool = False,
-        tts: bool = False,
-        upload_files: Optional[List[Tuple[bytes, str]]] = None,
-        **kw: Any,
-    ) -> AsyncGenerator[Union[str, Dict[str, Any]], None]:
-        last_error: Optional[Exception] = None
-        for attempt in range(3):
-            if attempt:
-                await asyncio.sleep(2 ** (attempt - 1))
-            try:
-                async for chunk in self._do_request(
-                    candidate,
-                    messages,
-                    model,
-                    stream=stream,
-                    thinking=thinking,
-                    search=search,
-                    tts=tts,
-                    upload_files=upload_files,
-                ):
-                    yield chunk
-                return
-            except TokenExpiredError as exc:
-                email = str(candidate.meta.get("email", ""))
-                account = self._account_states.get(email)
-                if account is not None:
-                    account.is_login = False
-                    account.token = ""
-                    account.token_expires = 0.0
-                    self._rebuild_candidates()
-                    self._save_persist()
-                    try:
-                        await self._login_and_configure(account)
-                        self._rebuild_candidates()
-                        candidate.meta["token"] = account.token
-                        candidate.meta["user_id"] = account.user_id
-                        self._save_persist()
-                        continue
-                    except Exception as relogin_exc:
-                        self._log_login_failure(account.username[:6], str(relogin_exc))
-                raise exc
-            except WafBlockedError as exc:
-                last_error = exc
-                self._log_retry(f"WAF retry {attempt + 1}/3")
-            except Exception as exc:
-                last_error = exc
-                self._log_retry(f"retry {attempt + 1}/3: {exc}")
-        if last_error is not None:
-            raise last_error
-
-    async def _do_request(
-        self,
-        candidate: Candidate,
-        messages: List[Dict[str, Any]],
-        model: str,
-        *,
-        stream: bool = True,
-        thinking: bool = False,
-        search: bool = False,
-        tts: bool = False,
-        upload_files: Optional[List[Tuple[bytes, str]]] = None,
-    ) -> AsyncGenerator[Union[str, Dict[str, Any]], None]:
-        email = str(candidate.meta.get("email", ""))
-        account = self._account_states.get(email)
-        if (
-            account is None
-            or not account.is_login
-            or not account.token
-            or self._is_token_expired(account)
-        ):
-            raise RuntimeError("candidate account is not logged in")
-        candidate.meta["token"] = account.token
-        candidate.meta["user_id"] = account.user_id
-        candidate.meta["is_login"] = True
-        token = account.token
-        user_id = str(account.user_id or "")
-        if not token:
-            raise RuntimeError("candidate token is missing")
-        file_objects: List[Dict[str, Any]] = []
-        if upload_files:
-            for file_data, filename in upload_files:
-                file_objects.append(await self.upload_file(file_data, filename, token, user_id))
-        for data_uri in self._extract_base64_images(messages):
-            file_objects.append(await self.upload_file_from_base64(data_uri, token, user_id))
-        chat_id = await self._chat_session.create(token, model, "t2t")
-        self._active_chats[candidate.id] = chat_id
-        proxy_used = self._get_proxy_kwarg() is not None
-        request_start = time.time()
-        success = False
-        try:
-            # Qwen chat completions always respond as SSE; StreamHandler only
-            # parses event-stream bodies. Client stream=false must not disable
-            # upstream streaming or the race/single paths see empty output.
-            payload = build_payload(
-                messages=messages,
-                model=model,
-                chat_id=chat_id,
-                files=file_objects,
-                thinking_enabled=thinking,
-                thinking_mode="Thinking" if thinking else "Fast",
-                auto_search=search,
-                stream=True,
-            )
-            headers = build_headers(token, chat_id=chat_id, include_sse=True, fingerprint=self._fp, cookies=self._cookies)
-            async with self._session.post(
-                f"{BASE_URL}{CHAT_PATH}?chat_id={chat_id}",
-                json=payload,
-                headers=headers,
-                ssl=False,
-                timeout=aiohttp.ClientTimeout(connect=10, total=SSE_TIMEOUT),
-                proxy=self._get_proxy_kwarg(),
-            ) as response:
-                if response.status != 200:
-                    body = await response.text()
-                    if response.status == 401 or "Token has expired" in body or "unauthorized" in body.lower():
-                        raise TokenExpiredError(f"token expired: {body[:200]}")
-                    raise RuntimeError(f"chat HTTP {response.status}: {body[:300]}")
-                content_type = response.headers.get("Content-Type", "")
-                if "text/html" in content_type:
-                    raise WafBlockedError("upstream returned HTML instead of SSE")
-                if "application/json" in content_type:
-                    body = await response.text()
-                    if "Token has expired" in body or "unauthorized" in body.lower():
-                        raise TokenExpiredError(f"token expired: {body[:200]}")
-                    raise RuntimeError(f"Qwen chat returned non-stream JSON error: {body[:300]}")
-                handler = StreamHandler(self.download_image)
-                try:
-                    async for item in handler.stream(response):
-                        if handler.last_response_id:
-                            self._active_responses[candidate.id] = handler.last_response_id
-                        yield item
-                except (aiohttp.ClientError, asyncio.IncompleteReadError, ConnectionResetError):
-                    response_id = handler.last_response_id
-                    if not response_id:
-                        raise
-                    async for item in self._chat_session.resume_stream(
-                        chat_id, response_id, token, handler,
-                    ):
-                        if handler.last_response_id:
-                            self._active_responses[candidate.id] = handler.last_response_id
-                        yield item
-                if tts and handler.last_response_id:
-                    await self.request_tts(chat_id, handler.last_response_id, token, TTS_DIR)
-                success = True
-        finally:
-            self._active_chats.pop(candidate.id, None)
-            self._active_responses.pop(candidate.id, None)
-            asyncio.ensure_future(self._chat_session.cleanup(chat_id, token))
-            if SMART_PROXY_ENABLED:
-                if success:
-                    self._proxy_selector.record(proxy_used, True, (time.time() - request_start) * 1000)
-                else:
-                    self._proxy_selector.record(proxy_used, False)
-
-    async def stop_generation(self, chat_id: str, token: str, response_id: str = "") -> bool:
-        return await self._chat_session.stop(chat_id, token, response_id)
-
-    async def delete_chat(self, chat_id: str, token: str) -> bool:
-        return await self._chat_session.delete(chat_id, token)
-
-    async def stop_candidate_generation(self, candidate: Candidate) -> bool:
-        chat_id = self._active_chats.get(candidate.id)
-        if not chat_id:
-            return False
-        response_id = self._active_responses.get(candidate.id, "")
-        return await self.stop_generation(
-            chat_id,
-            str(candidate.meta.get("token", "")),
-            response_id,
-        )

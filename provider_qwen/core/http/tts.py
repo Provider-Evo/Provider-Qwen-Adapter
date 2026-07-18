@@ -43,9 +43,9 @@ from typing import Awaitable, Callable, List, Optional, Tuple
 
 import aiohttp
 
-from ..config.endpoints import BASE_URL, TTS_DIR, TTS_PATH, TTS_TIMEOUT
+from ..config.endpts import BASE_URL, TTS_DIR, TTS_PATH, TTS_TIMEOUT
 from .headers import build_headers
-from .payloads import build_replace_content_payload, build_tts_payload
+from .payload import build_replace_content_payload, build_tts_payload
 from ..store.storage import save_wav_file
 
 
@@ -109,6 +109,44 @@ class TtsService:
         ) as response:
             return response.status == 200
 
+    @staticmethod
+    def _extract_tts_fragment(line_bytes: bytes, chunks: List[str]) -> bool:
+        """Parse one SSE line; append any TTS fragment to chunks. Return True if stream finished."""
+        line = line_bytes.decode("utf-8", errors="replace").strip()
+        if not line.startswith("data:"):
+            return False
+        data_str = line[5:].lstrip()
+        if not data_str or data_str == "[DONE]":
+            return False
+        payload = json.loads(data_str)
+        choices = payload.get("choices") or []
+        if not choices:
+            return False
+        delta = choices[0].get("delta", {})
+        tts_fragment = delta.get("tts")
+        if tts_fragment:
+            chunks.append(tts_fragment)
+        return delta.get("status") == "finished"
+
+    async def _collect_tts_chunks(self, response: aiohttp.ClientResponse) -> List[str]:
+        """Read the SSE response body and collect TTS audio fragments."""
+        chunks: List[str] = []
+        buffer = b""
+        async for raw in response.content.iter_any():
+            if not raw:
+                continue
+            buffer += raw
+            lines = buffer.split(b"\n")
+            buffer = lines[-1]
+            finished = False
+            for line_bytes in lines[:-1]:
+                if self._extract_tts_fragment(line_bytes, chunks):
+                    finished = True
+                    break
+            if finished:
+                break
+        return chunks
+
     async def request_tts(
         self,
         chat_id: str,
@@ -125,7 +163,6 @@ class TtsService:
             cookies=self._cookies(),
         )
         headers["Accept"] = "*/*"
-        chunks: List[str] = []
         async with self._session.post(
             f"{BASE_URL}{TTS_PATH}?chat_id={chat_id}",
             json=build_tts_payload(chat_id, response_id),
@@ -136,30 +173,7 @@ class TtsService:
         ) as response:
             if response.status != 200:
                 return None
-            buffer = b""
-            async for raw in response.content.iter_any():
-                if not raw:
-                    continue
-                buffer += raw
-                lines = buffer.split(b"\n")
-                buffer = lines[-1]
-                for line_bytes in lines[:-1]:
-                    line = line_bytes.decode("utf-8", errors="replace").strip()
-                    if not line.startswith("data:"):
-                        continue
-                    data_str = line[5:].lstrip()
-                    if not data_str or data_str == "[DONE]":
-                        continue
-                    payload = json.loads(data_str)
-                    choices = payload.get("choices") or []
-                    if not choices:
-                        continue
-                    delta = choices[0].get("delta", {})
-                    tts_fragment = delta.get("tts")
-                    if tts_fragment:
-                        chunks.append(tts_fragment)
-                    if delta.get("status") == "finished":
-                        break
+            chunks = await self._collect_tts_chunks(response)
         if not chunks:
             return None
         combined = "".join(chunks)
@@ -182,7 +196,7 @@ from .headers import (
     build_stop_headers,
 )
 
-from .payloads import (
+from .payload import (
     build_payload,
     build_new_chat_payload,
     build_stop_payload,

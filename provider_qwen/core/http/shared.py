@@ -39,7 +39,7 @@ shared 模块。
 from typing import Any, Dict
 
 from ..store.cdn import build_cdn_video_url
-from ..config.constants import (
+from ..config.consts import (
     BASE_URL,
     CAPS,
     MODELS,
@@ -90,13 +90,13 @@ from ..auth.crypto import (
 )
 from ..media.mimes import DATA_URI_EXT_MAP, EXTENSION_TO_MIME
 from ..auth.cookies import HASH_FIELDS
-from ..config.endpoints import *
+from ..config.endpts import *
 from ..media.files import build_file_object, build_url_file_object
 from .headers import build_cookie_string, build_headers, build_login_headers, build_stop_headers
 from ..media.oss import build_oss_authorization
 from ..store.storage import save_image_file, save_video_file, save_wav_file
 from ..config.models import extract_model_ids
-from .payloads import (
+from .payload import (
     DEFAULT_FEATURE_CONFIG,
     build_i2v_payload,
     build_new_chat_payload,
@@ -105,7 +105,7 @@ from .payloads import (
     build_stop_payload,
     build_tts_payload,
 )
-from ..config.settings import DEFAULT_FULL_SETTINGS
+from ..config.config import DEFAULT_FULL_SETTINGS
 from .sse import parse_sse_event, parse_sse_line
 from ..media.mimes import get_file_category, get_mime_type
 from ..store.storage import build_wav_from_pcm
@@ -202,7 +202,7 @@ from .headers import (
     build_stop_headers,
 )
 
-from .payloads import (
+from .payload import (
     build_payload,
     build_new_chat_payload,
     build_stop_payload,

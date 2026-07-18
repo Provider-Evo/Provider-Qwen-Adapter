@@ -43,7 +43,7 @@ from typing import Any, AsyncGenerator, Dict, List, Optional, Union
 import aiohttp
 
 try:
-    from src.core.dispatch.candidate import Candidate
+    from src.core.dispatch.cand import Candidate
 except ModuleNotFoundError:
     from .runtime import Candidate
 

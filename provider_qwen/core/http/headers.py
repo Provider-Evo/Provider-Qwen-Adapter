@@ -41,7 +41,7 @@ from datetime import datetime
 from typing import Any, Dict, Optional
 
 from ..auth.crypto import get_baxia_tokens
-from ..config.endpoints import (
+from ..config.endpts import (
     BASE_URL,
     CHAT_ORIGIN,
     SEC_CH_UA,
@@ -160,7 +160,7 @@ def build_stop_headers(token: str, *, cookies: Optional[Dict[str, Any]] = None) 
 # 重导出 — 同包内协同模块的公共符号（保持外部 ``from .. import`` 路径稳定）
 # =======================================================================
 
-from .payloads import (
+from .payload import (
     build_payload,
     build_new_chat_payload,
     build_stop_payload,

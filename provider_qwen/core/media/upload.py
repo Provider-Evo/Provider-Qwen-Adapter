@@ -13,7 +13,7 @@ from urllib.parse import urlparse
 
 import aiohttp
 
-from ..config.endpoints import BASE_URL, GENERATED_IMAGE_DIR, STS_TOKEN_PATHS, USER_AGENT
+from ..config.endpts import BASE_URL, GENERATED_IMAGE_DIR, STS_TOKEN_PATHS, USER_AGENT
 from .files import build_file_object
 from .mimes import DATA_URI_EXT_MAP, get_file_category, get_mime_type
 from .oss import build_oss_authorization

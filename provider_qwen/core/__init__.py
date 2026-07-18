@@ -26,7 +26,7 @@ from .auth.crypto import (
     lzw_compress,
 )
 from .auth.bxumid import validate_bxumidtoken
-from .config.endpoints import *
+from .config.endpts import *
 
 __all__ = [
     "BAXIA_VERSION",

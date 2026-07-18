@@ -1,0 +1,8 @@
+from __future__ import annotations
+
+from typing import Dict, List
+
+# Qwen 登录账号池示例（复制本文件为 accounts.py 并填入真实账号密码）
+ACCOUNTS: List[Dict[str, str]] = [
+    {"username": "example@example.com", "password": "example-password"},
+]

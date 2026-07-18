@@ -64,16 +64,10 @@ class StreamHandler:
         self.last_response_id = None
         self._thinking_count = 0
         self._tail = b""
-        logger.debug(
-            "Qwen SSE 响应: status={} content_type={}",
-            resp.status,
-            resp.headers.get("Content-Type", ""),
-        )
         total_bytes = 0
         buffer = await resp.content.readany()
         total_bytes += len(buffer)
         if buffer:
-            logger.debug("Qwen SSE 首块内容: {}", buffer[:500])
             async for item in self._process_buffer(buffer):
                 yield item
             buffer = self._tail
@@ -85,7 +79,6 @@ class StreamHandler:
             async for item in self._process_buffer(buffer):
                 yield item
             buffer = self._tail
-        logger.debug("Qwen SSE 流结束: total_bytes={}", total_bytes)
 
     async def _process_buffer(
         self,
@@ -108,7 +101,6 @@ class StreamHandler:
         event: Dict[str, Any],
     ) -> AsyncGenerator[Union[str, Dict[str, Any]], None]:
         event_type = event.get("type", "")
-        logger.debug("Qwen SSE 事件: type={} keys={}", event_type, list(event.keys()))
         if event_type == "error":
             raise RuntimeError(f"Qwen server error: {event.get('message', '')}")
         if event_type == "response_created":
@@ -198,7 +190,7 @@ from .headers import (
     build_stop_headers,
 )
 
-from .payloads import (
+from .payload import (
     build_payload,
     build_new_chat_payload,
     build_stop_payload,

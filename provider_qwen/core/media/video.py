@@ -43,9 +43,9 @@ from typing import Any, Awaitable, Callable, Dict, Optional
 import aiohttp
 
 from ..store.cdn import build_cdn_video_url
-from ..config.endpoints import BASE_URL, CHAT_PATH, SSE_TIMEOUT, TASK_STATUS_PATH, USER_AGENT, VIDEO_TASK_MAX_POLL_TIME, VIDEO_TASK_POLL_INTERVAL
+from ..config.endpts import BASE_URL, CHAT_PATH, SSE_TIMEOUT, TASK_STATUS_PATH, USER_AGENT, VIDEO_TASK_MAX_POLL_TIME, VIDEO_TASK_POLL_INTERVAL
 from ..http.headers import build_headers
-from ..http.payloads import build_i2v_payload
+from ..http.payload import build_i2v_payload
 from ..store.storage import save_video_file
 
 

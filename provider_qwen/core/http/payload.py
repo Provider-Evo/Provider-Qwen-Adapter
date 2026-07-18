@@ -6,7 +6,7 @@ import time
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
-from ..config.endpoints import API_VERSION, USE_LOCAL_MODE
+from ..config.endpts import API_VERSION, USE_LOCAL_MODE
 
 DEFAULT_FEATURE_CONFIG: Dict[str, Any] = {
     "thinking_enabled": True,
@@ -62,6 +62,55 @@ def _collect_user_content(messages: List[Dict[str, Any]]) -> Tuple[List[str], Li
     return text_parts, extra_files
 
 
+def _build_feature_config(
+    thinking_enabled: bool,
+    auto_thinking: bool,
+    thinking_mode: str,
+    thinking_format: str,
+    auto_search: bool,
+) -> Dict[str, Any]:
+    feature_config = dict(DEFAULT_FEATURE_CONFIG)
+    feature_config.update(
+        {
+            "thinking_enabled": thinking_enabled,
+            "auto_thinking": auto_thinking,
+            "thinking_mode": thinking_mode,
+            "thinking_format": thinking_format,
+            "auto_search": auto_search,
+        }
+    )
+    return feature_config
+
+
+def _build_user_message(
+    *,
+    content: str,
+    all_files: List[Dict[str, Any]],
+    model: str,
+    parent_id: Optional[str],
+    chat_type: str,
+    effective_sub_chat_type: str,
+    feature_config: Dict[str, Any],
+    timestamp: int,
+    assistant_fid: str,
+) -> Dict[str, Any]:
+    return {
+        "fid": str(uuid.uuid4()),
+        "parentId": parent_id,
+        "childrenIds": [assistant_fid],
+        "role": "user",
+        "content": content,
+        "user_action": "chat",
+        "files": all_files,
+        "timestamp": timestamp,
+        "models": [model],
+        "chat_type": chat_type,
+        "feature_config": feature_config,
+        "extra": {"meta": {"subChatType": effective_sub_chat_type}},
+        "sub_chat_type": effective_sub_chat_type,
+    }
+
+
 def build_payload(
     messages: List[Dict[str, Any]],
     model: str,
@@ -83,34 +132,22 @@ def build_payload(
     text_parts, extra_files = _collect_user_content(messages)
     content = "\n".join(part for part in text_parts if part)
     all_files = list(files or []) + extra_files
-    user_fid = str(uuid.uuid4())
     assistant_fid = str(uuid.uuid4())
     timestamp = int(time.time() * 1000)
-    feature_config = dict(DEFAULT_FEATURE_CONFIG)
-    feature_config.update(
-        {
-            "thinking_enabled": thinking_enabled,
-            "auto_thinking": auto_thinking,
-            "thinking_mode": thinking_mode,
-            "thinking_format": thinking_format,
-            "auto_search": auto_search,
-        }
+    feature_config = _build_feature_config(
+        thinking_enabled, auto_thinking, thinking_mode, thinking_format, auto_search,
     )
-    user_message = {
-        "fid": user_fid,
-        "parentId": parent_id,
-        "childrenIds": [assistant_fid],
-        "role": "user",
-        "content": content,
-        "user_action": "chat",
-        "files": all_files,
-        "timestamp": timestamp,
-        "models": [model],
-        "chat_type": chat_type,
-        "feature_config": feature_config,
-        "extra": {"meta": {"subChatType": effective_sub_chat_type}},
-        "sub_chat_type": effective_sub_chat_type,
-    }
+    user_message = _build_user_message(
+        content=content,
+        all_files=all_files,
+        model=model,
+        parent_id=parent_id,
+        chat_type=chat_type,
+        effective_sub_chat_type=effective_sub_chat_type,
+        feature_config=feature_config,
+        timestamp=timestamp,
+        assistant_fid=assistant_fid,
+    )
     return {
         "stream": stream,
         "version": API_VERSION,
