@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import ssl
 import time
 from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple, Union
 
@@ -11,8 +12,12 @@ import aiohttp
 
 try:
     from src.core.dispatch.cand import Candidate
+    from src.core.utils.errors import ModerationError
 except ModuleNotFoundError:
     from .runtime import Candidate
+
+    class ModerationError(RuntimeError):
+        """Fallback when provider-core is not on the import path."""
 
 from ..config.consts import SMART_PROXY_ENABLED
 from ..config.endpts import BASE_URL, CHAT_PATH, SSE_TIMEOUT, TTS_DIR
@@ -20,6 +25,13 @@ from ..config.errors import WafBlockedError, TokenExpiredError, RateLimitedError
 from ..http.headers import build_headers
 from ..http.payload import build_payload
 from ..http.stream import StreamHandler
+
+# 上游返回自签/无效证书链，仍需保持不校验证书；同时关闭 TLS session ticket
+# 复用，避免连接池复用已失效的 ticket 导致 DECRYPTION_FAILED_OR_BAD_RECORD_MAC。
+_INSECURE_NO_TICKET_SSL_CONTEXT = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+_INSECURE_NO_TICKET_SSL_CONTEXT.check_hostname = False
+_INSECURE_NO_TICKET_SSL_CONTEXT.verify_mode = ssl.CERT_NONE
+_INSECURE_NO_TICKET_SSL_CONTEXT.options |= ssl.OP_NO_TICKET
 
 
 class ClientCompleteMixin:
@@ -66,6 +78,8 @@ class ClientCompleteMixin:
                 last_error = exc
                 self._log_retry("rate limited, skipping retries for this account")
                 break
+            except ModerationError:
+                raise
             except Exception as exc:
                 last_error = exc
                 self._log_retry("retry {}/3: {}".format(attempt + 1, exc))
@@ -189,7 +203,7 @@ class ClientCompleteMixin:
                 "{}{}?chat_id={}".format(BASE_URL, CHAT_PATH, chat_id),
                 json=payload,
                 headers=headers,
-                ssl=False,
+                ssl=_INSECURE_NO_TICKET_SSL_CONTEXT,
                 timeout=aiohttp.ClientTimeout(connect=10, total=SSE_TIMEOUT),
                 proxy=self._get_proxy_kwarg(),
             ) as response:
@@ -227,7 +241,7 @@ class ClientCompleteMixin:
                 if handler.last_response_id:
                     self._active_responses[candidate.id] = handler.last_response_id
                 yield item
-        except (aiohttp.ClientError, asyncio.IncompleteReadError, ConnectionResetError):
+        except (aiohttp.ClientError, asyncio.IncompleteReadError, ConnectionResetError, ssl.SSLError):
             response_id = handler.last_response_id
             if not response_id:
                 raise

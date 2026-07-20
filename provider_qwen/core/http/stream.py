@@ -1,41 +1,6 @@
-"""
-stream 模块。
-
-本文件为 Provider-Evo 项目标准模块，使用以下约定：
-
-- 模块路径：provider-plugin.Provider-Qwen-Adapter.provider_qwen.core.http.stream
-- 文件名：stream.py
-- 父包：provider-plugin/Provider-Qwen-Adapter/provider_qwen/core/http
-
-职责：
-
-    作为 provider / 核心子系统的标准模块入口；
-    通常被 ``plugin.py`` 或上层 ``client.py`` 通过显式 import 使用。
-
-对外接口：
-
-    本模块的 ``__all__`` 列出对外可导入的符号集合；其他内部符号
-    可能在重构中调整，调用方应只依赖 ``__all__`` 暴露的稳定 API。
-
-集成：
-
-    - SDK 入口：``plugin.py`` 中 ``create_plugin()`` 引用本模块以构造 platform adapter。
-    - 入口路由：``provider-self/src/routes/openai`` 通过 ``from src.core...`` 间接使用。
-    - 测试：本目录下的 ``tests/`` 子目录覆盖本模块的核心逻辑。
-
-依赖：
-
-    - 仅依赖 ``provider-sdk`` 与 Python 3.8+ 标准库；不引入第三方 HTTP 库。
-    - 不直接读环境变量；所有配置走 ``config/main_config.toml``。
-
-修改指引：
-
-    - 调整本模块时同步更新 ``docs-src/plugins/<name>.md`` 与对应 ``tests/``。
-    - 保持单文件 200-400 行；超长请拆为子包并通过 ``__init__.py`` 重新导出。
-    - 严禁放置 placeholder / 兜底 / 伪装通过的代码（见 ``AGENTS.md`` Hard Constraints）。
-"""
 
 
+import ast
 import asyncio
 import json
 import uuid
@@ -44,7 +9,38 @@ from typing import Any, AsyncGenerator, Awaitable, Callable, Dict, List, Optiona
 import aiohttp
 from loguru import logger
 
+try:
+    from src.core.utils.errors import ModerationError
+except ModuleNotFoundError:
+    ModerationError = RuntimeError  # type: ignore[misc,assignment]
+
 from .sse import parse_sse_event
+
+
+def _parse_sse_error_payload(message: Any) -> Any:
+    """Normalize Qwen SSE error payloads that may arrive as dict or repr string."""
+    if isinstance(message, dict):
+        return message
+    if not isinstance(message, str):
+        return message
+    text = message.strip()
+    if text.startswith("{") and text.endswith("}"):
+        try:
+            parsed = ast.literal_eval(text)
+            if isinstance(parsed, dict):
+                return parsed
+        except (ValueError, SyntaxError):
+            pass
+    return message
+
+
+def _raise_for_sse_error(message: Any) -> None:
+    """Raise typed errors for known upstream SSE failures."""
+    payload = _parse_sse_error_payload(message)
+    if isinstance(payload, dict) and payload.get("code") == "data_inspection_failed":
+        details = payload.get("details") or "输入内容未通过安全审核"
+        raise ModerationError(str(details), status_code=400)
+    raise RuntimeError("Qwen server error: {}".format(message))
 
 
 class StreamHandler:
@@ -102,42 +98,94 @@ class StreamHandler:
     ) -> AsyncGenerator[Union[str, Dict[str, Any]], None]:
         event_type = event.get("type", "")
         if event_type == "error":
-            raise RuntimeError(f"Qwen server error: {event.get('message', '')}")
-        if event_type == "response_created":
-            self.last_response_id = event.get("response_id")
-        elif event_type == "answer":
-            text = self._strip_tags(event.get("content", ""))
-            if text:
-                yield text
-        elif event_type == "thinking":
-            text = self._strip_tags(event.get("content", ""))
-            if text:
-                yield {"thinking": text}
-        elif event_type == "thinking_summary":
-            for piece in self._iter_thinking_pieces(event):
-                yield {"thinking": piece}
-        elif event_type == "image_gen_tool":
-            calls = await asyncio.gather(
-                *[self._build_single_image_call(url) for url in event.get("urls", [])]
-            )
-            if calls:
-                yield {"tool_calls": calls}
-        elif event_type == "image_gen":
-            content = event.get("content", "")
-            if content:
-                yield {"tool_calls": [await self._build_single_image_call(content)]}
-        elif event_type == "video_gen":
-            content = event.get("content", "")
-            if content:
-                yield {"tool_calls": [self._wrap_tool_call("qwen.video_gen", {"url": content})]}
-        elif event_type == "usage":
-            yield {"usage": event.get("data", {})}
-        elif event_type == "other":
-            content = self._strip_tags(event.get("content", ""))
-            if content:
-                yield content
+            _raise_for_sse_error(event.get("message", ""))
+        async for item in self._yield_event_items(event_type, event):
+            yield item
         if event.get("usage") and event_type != "usage":
             yield {"usage": event["usage"]}
+
+    async def _yield_event_items(
+        self,
+        event_type: str,
+        event: Dict[str, Any],
+    ) -> AsyncGenerator[Union[str, Dict[str, Any]], None]:
+        if event_type == "response_created":
+            self.last_response_id = event.get("response_id")
+            return
+        if event_type == "answer":
+            async for item in self._yield_text_content(event):
+                yield item
+            return
+        if event_type == "thinking":
+            async for item in self._yield_thinking_content(event):
+                yield item
+            return
+        if event_type == "thinking_summary":
+            for piece in self._iter_thinking_pieces(event):
+                yield {"thinking": piece}
+            return
+        if event_type == "image_gen_tool":
+            async for item in self._yield_image_gen_tool(event):
+                yield item
+            return
+        if event_type == "image_gen":
+            async for item in self._yield_single_image_gen(event):
+                yield item
+            return
+        if event_type == "video_gen":
+            async for item in self._yield_video_gen(event):
+                yield item
+            return
+        if event_type == "usage":
+            yield {"usage": event.get("data", {})}
+            return
+        if event_type == "other":
+            async for item in self._yield_text_content(event):
+                yield item
+
+    async def _yield_text_content(
+        self,
+        event: Dict[str, Any],
+    ) -> AsyncGenerator[str, None]:
+        text = self._strip_tags(event.get("content", ""))
+        if text:
+            yield text
+
+    async def _yield_thinking_content(
+        self,
+        event: Dict[str, Any],
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        text = self._strip_tags(event.get("content", ""))
+        if text:
+            yield {"thinking": text}
+
+    async def _yield_image_gen_tool(
+        self,
+        event: Dict[str, Any],
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        calls = await asyncio.gather(
+            *[self._build_single_image_call(url) for url in event.get("urls", [])]
+        )
+        if calls:
+            yield {"tool_calls": calls}
+
+    async def _yield_single_image_gen(
+        self,
+        event: Dict[str, Any],
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        content = event.get("content", "")
+        if not content:
+            return
+        yield {"tool_calls": [await self._build_single_image_call(content)]}
+
+    async def _yield_video_gen(
+        self,
+        event: Dict[str, Any],
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        content = event.get("content", "")
+        if not content:
+            return
+        yield {"tool_calls": [self._wrap_tool_call("qwen.video_gen", {"url": content})]}
 
     def _iter_thinking_pieces(self, event: Dict[str, Any]) -> List[str]:
         if event.get("status") != "typing":

@@ -1,6 +1,6 @@
-from __future__ import annotations
-
 """Chat-session HTTP helpers."""
+
+from __future__ import annotations
 
 import asyncio
 from typing import Any, AsyncGenerator, Callable, Dict, Optional, Tuple, Union
@@ -11,9 +11,9 @@ from ..config.endpts import BASE_URL, CHAT_PATH, DELETE_CHAT_PATH, GENERATED_IMA
 from ..config.errors import TokenExpiredError, WafBlockedError
 from ..http.headers import build_headers, build_stop_headers
 from ..http.payload import build_new_chat_payload, build_payload, build_stop_payload
+from ..http.sse import parse_sse_event
 from ..http.stream import StreamHandler
 from .storage import save_image_file
-from ..http.sse import parse_sse_event
 
 
 class ChatSession:
@@ -120,9 +120,11 @@ class ChatSession:
 
     async def cleanup(self, chat_id: str, token: str) -> None:
         """Delete a chat, suppressing transport failures."""
+        if self._session.closed:
+            return
         try:
             await self.delete(chat_id, token)
-        except (aiohttp.ClientError, asyncio.TimeoutError):
+        except (aiohttp.ClientError, asyncio.TimeoutError, RuntimeError):
             return
 
     async def download_image(self, image_url: str, save_dir: str = GENERATED_IMAGE_DIR) -> Optional[str]:

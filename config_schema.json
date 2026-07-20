@@ -14,6 +14,12 @@
       },
       "default": [],
       "description": "Qwen 登录账号列表，每项含 username 和 password"
+    },
+    "use_proxy": {
+      "type": "boolean",
+      "title": "Use Proxy",
+      "default": true,
+      "description": "启用时允许本平台使用主配置 [proxy] 中的全局代理"
     }
   },
   "required": ["accounts"]

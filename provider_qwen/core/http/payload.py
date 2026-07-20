@@ -27,8 +27,41 @@ def _extract_url(url_obj: Any) -> str:
     return ""
 
 
-def _collect_user_content(messages: List[Dict[str, Any]]) -> Tuple[List[str], List[Dict[str, Any]]]:
+def _append_media_file(
+    extra_files: List[Dict[str, Any]],
+    url: str,
+    media_type: str,
+) -> None:
     from ..media.files import build_url_file_object
+    if url and not url.startswith("data:"):
+        extra_files.append(build_url_file_object(url, media_type))
+
+
+def _collect_content_part(
+    part: Any,
+    text_parts: List[str],
+    extra_files: List[Dict[str, Any]],
+) -> None:
+    if not isinstance(part, dict):
+        return
+    part_type = part.get("type")
+    if part_type == "text":
+        text_parts.append(str(part.get("text", "")))
+        return
+    if part_type == "image_url":
+        _append_media_file(extra_files, _extract_url(part.get("image_url")), "image")
+        return
+    if part_type == "video_url":
+        _append_media_file(extra_files, _extract_url(part.get("video_url")), "video")
+        return
+    if part_type != "input_audio":
+        return
+    audio_obj = part.get("input_audio") or {}
+    url = _extract_url(audio_obj.get("url") if isinstance(audio_obj, dict) else "")
+    _append_media_file(extra_files, url, "audio")
+
+
+def _collect_user_content(messages: List[Dict[str, Any]]) -> Tuple[List[str], List[Dict[str, Any]]]:
     text_parts: List[str] = []
     extra_files: List[Dict[str, Any]] = []
     for message in messages:
@@ -41,24 +74,7 @@ def _collect_user_content(messages: List[Dict[str, Any]]) -> Tuple[List[str], Li
         if not isinstance(content, list):
             continue
         for part in content:
-            if not isinstance(part, dict):
-                continue
-            part_type = part.get("type")
-            if part_type == "text":
-                text_parts.append(str(part.get("text", "")))
-            elif part_type == "image_url":
-                url = _extract_url(part.get("image_url"))
-                if url and not url.startswith("data:"):
-                    extra_files.append(build_url_file_object(url, "image"))
-            elif part_type == "video_url":
-                url = _extract_url(part.get("video_url"))
-                if url and not url.startswith("data:"):
-                    extra_files.append(build_url_file_object(url, "video"))
-            elif part_type == "input_audio":
-                audio_obj = part.get("input_audio") or {}
-                url = _extract_url(audio_obj.get("url") if isinstance(audio_obj, dict) else "")
-                if url and not url.startswith("data:"):
-                    extra_files.append(build_url_file_object(url, "audio"))
+            _collect_content_part(part, text_parts, extra_files)
     return text_parts, extra_files
 
 

@@ -151,7 +151,9 @@ class QwenClient(AuthMixin, AuthScheduleMixin, ClientCompleteMixin, UploadMixin,
         if not config.proxy.proxy_enabled:
             return None
         if self._proxy_state.override is True:
-            return get_proxy_server() if config.platforms_proxy.is_platform_enabled("qwen") else None
+            from ..config.proxy import load_use_proxy
+
+            return get_proxy_server() if load_use_proxy() else None
         if self._proxy_state.override is False:
             return None
         from ..config.consts import SMART_PROXY_ENABLED

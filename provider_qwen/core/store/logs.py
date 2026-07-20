@@ -1,11 +1,3 @@
-"""logs 模块 — Provider 适配器层。
-
-职责：
-    作为 Provider-Evo 项目标准模块，提供 logs 能力。
-
-本文件为 Provider-Evo 项目标准模块；保持单文件 200-400 行。
-修改指引参见文件末尾的"本模块对外契约"章节（共 20 条）。
-"""
 
 
 
@@ -62,12 +54,12 @@ class LogsMixin:
         if not self._retry_log_buffer:
             return
         for message in self._retry_log_buffer:
-            logger.warning("Qwen 请求重试: %s", message)
+            logger.debug("Qwen 请求重试: %s", message)
         self._retry_log_buffer.clear()
 
     def _flush_login_fail_buffer_now(self) -> None:
         if not self._login_fail_buffer:
             return
         for username_prefix, error_message in self._login_fail_buffer:
-            logger.warning("Qwen 登录失败 %s: %s", username_prefix, error_message)
+            logger.debug("Qwen 登录失败 %s: %s", username_prefix, error_message)
         self._login_fail_buffer.clear()
