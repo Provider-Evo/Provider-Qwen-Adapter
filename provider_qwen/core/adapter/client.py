@@ -42,7 +42,7 @@ from ..config.endpts import (
 from ..http.headers import build_headers
 from ..store.logs import LogsMixin
 from ..media.media import MediaMixin
-from ..config.models import extract_model_ids
+from ..config.models import extract_model_ids, parse_model_catalog
 from ..store.persist import load_persist, save_persist
 from ..config.proxy import ProxyState
 from ..media.upload import UploadMixin
@@ -107,6 +107,9 @@ class QwenClient(AuthMixin, AuthScheduleMixin, ClientCompleteMixin, UploadMixin,
         self._account_states: Dict[str, Account] = {}
         self._candidates: List[Candidate] = []
         self._models: List[str] = list(MODELS)
+        self._model_capabilities: Dict[str, Dict[str, bool]] = {}
+        self._model_context: Dict[str, int] = {}
+        self._model_info: Dict[str, Any] = {}
         self._fp = generate_fingerprint()
         self._cookies: Dict[str, Any] = generate_cookies(self._fp)
         self._bg_tasks: List[asyncio.Task] = []
@@ -130,6 +133,9 @@ class QwenClient(AuthMixin, AuthScheduleMixin, ClientCompleteMixin, UploadMixin,
 
     def get_models(self) -> List[str]:
         return list(self._models)
+
+    def get_model_info(self) -> Dict[str, Any]:
+        return dict(self._model_info)
 
     def set_proxy_enabled(self, enabled: bool) -> None:
         self._proxy_state.set_enabled(enabled)
@@ -216,6 +222,28 @@ class QwenClient(AuthMixin, AuthScheduleMixin, ClientCompleteMixin, UploadMixin,
         self._models = merged
         self._rebuild_candidates()
 
+    def _apply_model_catalog(
+        self,
+        ids: List[str],
+        model_capabilities: Dict[str, Dict[str, bool]],
+        model_context: Dict[str, int],
+        model_info: Dict[str, Any],
+    ) -> None:
+        if ids:
+            self._models = list(ids)
+        self._model_capabilities = dict(model_capabilities)
+        self._model_context = dict(model_context)
+        self._model_info = dict(model_info)
+        self._rebuild_candidates()
+
+    def _union_platform_caps(self) -> Dict[str, bool]:
+        caps = dict(CAPS)
+        for per_model in self._model_capabilities.values():
+            for key, value in per_model.items():
+                if value:
+                    caps[key] = True
+        return caps
+
     async def close(self) -> None:
         self._closing = True
         self._cancel_log_flush_tasks()
@@ -244,6 +272,7 @@ class QwenClient(AuthMixin, AuthScheduleMixin, ClientCompleteMixin, UploadMixin,
         self._flush_login_fail_buffer_now()
 
     def _rebuild_candidates(self) -> None:
+        platform_caps = self._union_platform_caps()
         self._candidates = [
             Candidate(
                 id=make_id("qwen", account.username[:12]),
@@ -256,8 +285,11 @@ class QwenClient(AuthMixin, AuthScheduleMixin, ClientCompleteMixin, UploadMixin,
                     "token": account.token,
                     "user_id": account.user_id,
                     "is_login": True,
+                    "model_capabilities": dict(self._model_capabilities),
+                    "model_context": dict(self._model_context),
+                    "model_info": dict(self._model_info),
                 },
-                **CAPS,
+                **platform_caps,
             )
             for account in self._account_states.values()
             if account.is_login
@@ -304,9 +336,10 @@ class QwenClient(AuthMixin, AuthScheduleMixin, ClientCompleteMixin, UploadMixin,
         await self._models_cache._do_refresh(self.fetch_remote_models, on_update=self._on_models_update)
 
     async def _on_models_update(self, models: List[str]) -> None:
-        self._models = list(models)
+        if models:
+            self._models = list(models)
         for cand in self._candidates:
-            cand.models = list(models)
+            cand.models = list(self._models)
         if self._account_states:
             self._rebuild_candidates()
 
@@ -314,7 +347,11 @@ class QwenClient(AuthMixin, AuthScheduleMixin, ClientCompleteMixin, UploadMixin,
         token = self._get_any_valid_token()
         if not token:
             return []
-        endpoints = ["{}{}".format(BASE_URL, MODELS_PATH), "{}/api/v1/models".format(BASE_URL)]
+        endpoints = [
+            "{}{}".format(BASE_URL, MODELS_PATH),
+            "{}{}".format(BASE_URL, MODELS_PATH.rstrip("/")),
+            "{}/api/v1/models".format(BASE_URL),
+        ]
         headers = build_headers(token, cookies=self._cookies)
         for endpoint in endpoints:
             try:
@@ -327,9 +364,15 @@ class QwenClient(AuthMixin, AuthScheduleMixin, ClientCompleteMixin, UploadMixin,
                 ) as response:
                     if response.status != 200:
                         continue
-                    models = extract_model_ids(await response.json(content_type=None))
-                    if models:
-                        return models
+                    raw = await response.json(content_type=None)
+                    ids, caps, ctx, info = parse_model_catalog(raw)
+                    if ids:
+                        self._apply_model_catalog(ids, caps, ctx, info)
+                        return list(ids)
+                    legacy = extract_model_ids(raw)
+                    if legacy:
+                        self.update_models(legacy)
+                        return list(legacy)
             except Exception:
                 continue
         return []

@@ -158,4 +158,5 @@ class QwenAdapter(PlatformAdapter):
         return {
             "platform": "qwen",
             "models": self._client.get_models(),
+            "model_info": self._client.get_model_info(),
         }
