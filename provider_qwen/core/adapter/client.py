@@ -42,6 +42,7 @@ from ..config.endpts import (
 from ..http.headers import build_headers
 from ..store.logs import LogsMixin
 from ..media.media import MediaMixin
+from provider_sdk.model_ids import ModelIdRegistry
 from ..config.models import extract_model_ids, parse_model_catalog
 from ..store.persist import load_persist, save_persist
 from ..config.proxy import ProxyState
@@ -106,7 +107,9 @@ class QwenClient(AuthMixin, AuthScheduleMixin, ClientCompleteMixin, UploadMixin,
         self._session: Optional[aiohttp.ClientSession] = None
         self._account_states: Dict[str, Account] = {}
         self._candidates: List[Candidate] = []
-        self._models: List[str] = list(MODELS)
+        self._model_registry = ModelIdRegistry("qwen")
+        self._model_registry.load()
+        self._models: List[str] = self._model_registry.register_many(MODELS)
         self._model_capabilities: Dict[str, Dict[str, bool]] = {}
         self._model_context: Dict[str, int] = {}
         self._model_info: Dict[str, Any] = {}
@@ -133,6 +136,13 @@ class QwenClient(AuthMixin, AuthScheduleMixin, ClientCompleteMixin, UploadMixin,
 
     def get_models(self) -> List[str]:
         return list(self._models)
+
+    def resolve_upstream_model(self, model: str) -> str:
+        """将对外公开模型名解析为上游 API 使用的模型名。"""
+        return self._model_registry.resolve_upstream(model)
+
+    def _register_upstream_models(self, upstream_ids: List[str]) -> List[str]:
+        return self._model_registry.register_many(upstream_ids)
 
     def get_model_info(self) -> Dict[str, Any]:
         return dict(self._model_info)
@@ -174,7 +184,9 @@ class QwenClient(AuthMixin, AuthScheduleMixin, ClientCompleteMixin, UploadMixin,
         for account in accounts:
             self._account_states[account.username] = Account(username=account.username, password=account.password)
         await self._models_cache.load()
-        self._models = list(self._models_cache.models)
+        self._model_registry.load()
+        if self._models_cache.models:
+            self.update_models(list(self._models_cache.models))
         self._cookies = load_persist(self._account_states, self._cookies, self._proxy_state)
         self._sync_expired_account_states()
         self._rebuild_candidates()
@@ -213,13 +225,21 @@ class QwenClient(AuthMixin, AuthScheduleMixin, ClientCompleteMixin, UploadMixin,
         )
 
     def update_models(self, models: List[str]) -> None:
-        merged: List[str] = []
-        seen = set()
-        for model in list(MODELS) + list(models):
+        upstream_ids: List[str] = []
+        seen: set[str] = set()
+        for model in list(MODELS):
             if model and model not in seen:
                 seen.add(model)
-                merged.append(model)
-        self._models = merged
+                upstream_ids.append(model)
+        for model in models:
+            if not model:
+                continue
+            upstream = self._model_registry.resolve_upstream(model)
+            if upstream not in seen:
+                seen.add(upstream)
+                upstream_ids.append(upstream)
+        public_ids = self._register_upstream_models(upstream_ids)
+        self._models = public_ids
         self._rebuild_candidates()
 
     def _apply_model_catalog(
@@ -229,8 +249,16 @@ class QwenClient(AuthMixin, AuthScheduleMixin, ClientCompleteMixin, UploadMixin,
         model_context: Dict[str, int],
         model_info: Dict[str, Any],
     ) -> None:
-        if ids:
-            self._models = list(ids)
+        upstream_ids: List[str] = []
+        for model_id in ids:
+            upstream = model_info.get(model_id, {}).get("upstream_id")
+            if isinstance(upstream, str) and upstream:
+                upstream_ids.append(upstream)
+            else:
+                upstream_ids.append(self.resolve_upstream_model(model_id))
+        if upstream_ids:
+            public_ids = self._register_upstream_models(upstream_ids)
+            self._models = public_ids
         self._model_capabilities = dict(model_capabilities)
         self._model_context = dict(model_context)
         self._model_info = dict(model_info)
@@ -337,7 +365,7 @@ class QwenClient(AuthMixin, AuthScheduleMixin, ClientCompleteMixin, UploadMixin,
 
     async def _on_models_update(self, models: List[str]) -> None:
         if models:
-            self._models = list(models)
+            self.update_models(models)
         for cand in self._candidates:
             cand.models = list(self._models)
         if self._account_states:
@@ -368,7 +396,7 @@ class QwenClient(AuthMixin, AuthScheduleMixin, ClientCompleteMixin, UploadMixin,
                     ids, caps, ctx, info = parse_model_catalog(raw)
                     if ids:
                         self._apply_model_catalog(ids, caps, ctx, info)
-                        return list(ids)
+                        return list(self._models)
                     legacy = extract_model_ids(raw)
                     if legacy:
                         self.update_models(legacy)

@@ -1,6 +1,8 @@
 
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
+from provider_sdk.model_ids import upstream_to_public_id
+
 _KEYS: Tuple[str, ...] = ("id", "modelId", "model_id", "name")
 
 
@@ -62,12 +64,15 @@ def iter_catalog_items(raw: Any) -> List[Dict[str, Any]]:
 
 
 def extract_model_ids(raw: Any) -> List[str]:
-    """Extract de-duplicated model identifiers from heterogeneous payloads."""
+    """Extract de-duplicated public model identifiers from heterogeneous payloads."""
     ids: List[str] = []
     seen: Set[str] = set()
     for item in iter_catalog_items(raw):
-        model_id = _yield_dict_id(item)
-        if model_id and model_id not in seen:
+        upstream_id = _yield_dict_id(item)
+        if not upstream_id:
+            continue
+        model_id = upstream_to_public_id(upstream_id)
+        if model_id not in seen:
             seen.add(model_id)
             ids.append(model_id)
     return ids
@@ -191,15 +196,16 @@ def parse_model_catalog(
     seen: Set[str] = set()
 
     for item in iter_catalog_items(raw):
-        model_id = _yield_dict_id(item)
-        if not model_id or model_id in seen:
+        upstream_id = _yield_dict_id(item)
+        if not upstream_id or upstream_id in seen:
             continue
 
         info = item.get("info") if isinstance(item.get("info"), dict) else {}
         if info.get("is_active") is False:
             continue
 
-        seen.add(model_id)
+        model_id = upstream_to_public_id(upstream_id)
+        seen.add(upstream_id)
         ids.append(model_id)
 
         meta = info.get("meta") if isinstance(info.get("meta"), dict) else {}
@@ -207,7 +213,9 @@ def parse_model_catalog(
         ctx = _context_length(meta)
         if ctx is not None:
             model_context[model_id] = ctx
-        model_info[model_id] = _build_model_info(item)
+        record = _build_model_info(item)
+        record["upstream_id"] = upstream_id
+        model_info[model_id] = record
 
     return ids, model_capabilities, model_context, model_info
 

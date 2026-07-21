@@ -186,6 +186,7 @@ class MediaMixin:
         download: bool = True,
     ) -> Dict[str, Any]:
         """Run the full image-to-video flow."""
+        model = self.resolve_upstream_model(model)
         try:
             chat_id = await self._create_chat(token, model, "i2v")
         except Exception as exc:

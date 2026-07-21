@@ -2,7 +2,7 @@
   "manifest_version": 2,
   "id": "nichengfuben.provider-qwen-adapter",
   "name": "Provider Qwen Adapter",
-  "version": "1.0.1",
+  "version": "1.0.3",
   "description": "qwen platform adapter plugin",
   "plugin_type": "platform",
   "author": {

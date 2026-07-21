@@ -50,6 +50,7 @@ class ClientCompleteMixin:
         upload_files: Optional[List[Tuple[bytes, str]]] = None,
         **kw: Any,
     ) -> AsyncGenerator[Union[str, Dict[str, Any]], None]:
+        model = self.resolve_upstream_model(model)
         last_error: Optional[Exception] = None
         for attempt in range(3):
             if attempt:
