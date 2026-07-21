@@ -6,7 +6,7 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict
 
-from ..config.endpts import COOKIE_REFRESH_INTERVAL, PERSIST_PATH
+from ..config.endpts import COOKIE_REFRESH_INTERVAL, PERSIST_PATH, TASK_TIMERS_PATH
 from ..config.proxy import ProxyState
 
 if TYPE_CHECKING:
@@ -73,3 +73,20 @@ def save_persist(
     tmp_path = path.with_suffix(path.suffix + ".tmp")
     tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     tmp_path.replace(path)
+
+
+def load_task_timers() -> Dict[str, float]:
+    path = Path(TASK_TIMERS_PATH)
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return {str(key): float(value) for key, value in data.items()}
+    except Exception:
+        return {}
+
+
+def save_task_timers(timers: Dict[str, float]) -> None:
+    path = Path(TASK_TIMERS_PATH)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(timers, indent=2), encoding="utf-8")

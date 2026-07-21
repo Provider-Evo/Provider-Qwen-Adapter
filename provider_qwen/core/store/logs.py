@@ -63,3 +63,17 @@ class LogsMixin:
         for username_prefix, error_message in self._login_fail_buffer:
             logger.debug("Qwen 登录失败 %s: %s", username_prefix, error_message)
         self._login_fail_buffer.clear()
+
+    def cancel_log_flush_tasks(self) -> None:
+        if self._relogin_flush_task is not None and not self._relogin_flush_task.done():
+            self._relogin_flush_task.cancel()
+            self._relogin_flush_task = None
+        self._flush_relogin_buffer_now()
+        if self._retry_log_flush_task is not None and not self._retry_log_flush_task.done():
+            self._retry_log_flush_task.cancel()
+            self._retry_log_flush_task = None
+        self._flush_retry_log_buffer_now()
+        if self._login_fail_flush_task is not None and not self._login_fail_flush_task.done():
+            self._login_fail_flush_task.cancel()
+            self._login_fail_flush_task = None
+        self._flush_login_fail_buffer_now()

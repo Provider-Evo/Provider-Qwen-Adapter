@@ -37,14 +37,13 @@ from ..config.endpts import (
     MODELS_PATH,
     PROXY_SELECTOR_PERSIST_PATH,
     PERSIST_INTERVAL,
-    TASK_TIMERS_PATH,
 )
 from ..http.headers import build_headers
 from ..store.logs import LogsMixin
 from ..media.media import MediaMixin
 from provider_sdk.model_ids import ModelIdRegistry
 from ..config.models import extract_model_ids, parse_model_catalog
-from ..store.persist import load_persist, save_persist
+from ..store.persist import load_persist, load_task_timers, save_persist, save_task_timers
 from ..config.proxy import ProxyState
 from ..media.upload import UploadMixin
 from ..http.tts import TtsService
@@ -274,7 +273,7 @@ class QwenClient(AuthMixin, AuthScheduleMixin, ClientCompleteMixin, UploadMixin,
 
     async def close(self) -> None:
         self._closing = True
-        self._cancel_log_flush_tasks()
+        self.cancel_log_flush_tasks()
         for task in self._bg_tasks:
             task.cancel()
         for task in self._bg_tasks:
@@ -284,20 +283,6 @@ class QwenClient(AuthMixin, AuthScheduleMixin, ClientCompleteMixin, UploadMixin,
                 continue
         self._bg_tasks.clear()
         self._save_persist()
-
-    def _cancel_log_flush_tasks(self) -> None:
-        if self._relogin_flush_task is not None and not self._relogin_flush_task.done():
-            self._relogin_flush_task.cancel()
-            self._relogin_flush_task = None
-        self._flush_relogin_buffer_now()
-        if self._retry_log_flush_task is not None and not self._retry_log_flush_task.done():
-            self._retry_log_flush_task.cancel()
-            self._retry_log_flush_task = None
-        self._flush_retry_log_buffer_now()
-        if self._login_fail_flush_task is not None and not self._login_fail_flush_task.done():
-            self._login_fail_flush_task.cancel()
-            self._login_fail_flush_task = None
-        self._flush_login_fail_buffer_now()
 
     def _rebuild_candidates(self) -> None:
         platform_caps = self._union_platform_caps()
@@ -341,19 +326,10 @@ class QwenClient(AuthMixin, AuthScheduleMixin, ClientCompleteMixin, UploadMixin,
         save_persist(self._account_states, self._cookies, self._proxy_state)
 
     def _load_task_timers(self) -> Dict[str, float]:
-        path = Path(TASK_TIMERS_PATH)
-        if not path.exists():
-            return {}
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-            return {str(key): float(value) for key, value in data.items()}
-        except Exception:
-            return {}
+        return load_task_timers()
 
     def _save_task_timers(self, timers: Dict[str, float]) -> None:
-        path = Path(TASK_TIMERS_PATH)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(timers, indent=2), encoding="utf-8")
+        save_task_timers(timers)
 
     async def _bg_persist(self) -> None:
         while not self._closing:
