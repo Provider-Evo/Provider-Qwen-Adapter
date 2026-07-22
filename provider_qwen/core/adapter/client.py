@@ -141,7 +141,7 @@ class QwenClient(AuthMixin, AuthScheduleMixin, ClientCompleteMixin, UploadMixin,
         return self._model_registry.resolve_upstream(model)
 
     def _register_upstream_models(self, upstream_ids: List[str]) -> List[str]:
-        return self._model_registry.register_many(upstream_ids)
+        return self._model_registry.register_merge(upstream_ids, fallback=MODELS)
 
     def get_model_info(self) -> Dict[str, Any]:
         return dict(self._model_info)
@@ -224,21 +224,8 @@ class QwenClient(AuthMixin, AuthScheduleMixin, ClientCompleteMixin, UploadMixin,
         )
 
     def update_models(self, models: List[str]) -> None:
-        upstream_ids: List[str] = []
-        seen: set[str] = set()
-        for model in list(MODELS):
-            if model and model not in seen:
-                seen.add(model)
-                upstream_ids.append(model)
-        for model in models:
-            if not model:
-                continue
-            upstream = self._model_registry.resolve_upstream(model)
-            if upstream not in seen:
-                seen.add(upstream)
-                upstream_ids.append(upstream)
-        public_ids = self._register_upstream_models(upstream_ids)
-        self._models = public_ids
+        """合并静态 MODELS 与外部模型列表（外部可能是公开名或上游名）。"""
+        self._models = self._model_registry.register_merge(models, fallback=MODELS)
         self._rebuild_candidates()
 
     def _apply_model_catalog(
